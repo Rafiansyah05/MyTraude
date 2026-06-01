@@ -4,11 +4,13 @@ Fetches and caches IDX market data including IHSG index and stock lists.
 """
 
 import asyncio
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-import aiohttp
-from bs4 import BeautifulSoup
 import json
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+from playwright.async_api import async_playwright, Error as PlaywrightError
 
 from config.settings import settings
 from utils.logger import get_logger
@@ -23,6 +25,8 @@ class IDXScraper:
     # Cache management
     _cache: Dict = {}
     _cache_timestamp: Optional[datetime] = None
+    _snapshot_cache_path: Path = Path(__file__).resolve().parent / "idx_summary_cache.json"
+    _snapshot_cache_days: int = 1
     
     @staticmethod
     def _normalize_ticker(ticker: str) -> str:
@@ -53,14 +57,14 @@ class IDXScraper:
         
         logger.info("Fetching IDX stocks list...")
 
-        # Try scraping the IDX summary page for a comprehensive list
+        # Use IDX JSON API as primary source
         try:
-            summary = await IDXScraper.fetch_summary()
-            if summary:
-                # Convert into expected dict form
+            idx_map = await IDXScraper.fetch_idx_summary()
+            if idx_map:
+                # Convert into expected dict form for compatibility
                 stocks = [
-                    {"ticker": item.get("ticker"), "name": item.get("name"), "sector": item.get("sector", "Unknown")}
-                    for item in summary
+                    {"ticker": k, "name": v.get("stock_name"), "sector": v.get("sector", "Unknown")}
+                    for k, v in idx_map.items()
                 ]
             else:
                 stocks = await IDXScraper._get_major_stocks()
@@ -103,255 +107,181 @@ class IDXScraper:
 
     @staticmethod
     async def fetch_summary(timeout: int = 15) -> Optional[List[Dict[str, Any]]]:
-        """Async fetch of IDX summary page. Parses HTML table into list of dicts."""
-        url = "https://www.idx.co.id/id/data-pasar/ringkasan-perdagangan/ringkasan-saham/"
+        """Fetch IDX market summary using official JSON endpoint.
+
+        This function replaces HTML scraping. It returns a list of rows
+        in a normalized dict form or None on failure.
+        """
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-            "Referer": "https://www.idx.co.id/",
+            'Accept': 'application/json',
+            'User-Agent': 'MyTraude/1.0 (+https://github.com)'
         }
 
-        def _parse_idx_api_payload(payload: Any) -> Optional[List[Dict[str, Any]]]:
-            try:
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                if isinstance(payload, dict):
-                    rows = payload.get("data") or payload.get("rows") or payload.get("results") or payload
-                else:
-                    rows = payload
+        def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+            # Normalize common field names
+            code = row.get('StockCode') or row.get('code') or row.get('symbol')
+            name = row.get('StockName') or row.get('name') or row.get('company')
+            prev = row.get('Previous') or row.get('PreviousClose') or row.get('previous') or None
+            openp = row.get('OpenPrice') or row.get('Open') or row.get('open') or None
+            high = row.get('High') or row.get('high') or None
+            low = row.get('Low') or row.get('low') or None
+            close = row.get('Close') or row.get('close') or None
+            change = row.get('Change') or row.get('change') or None
+            volume = row.get('Volume') or row.get('volume') or None
+            value = row.get('Value') or row.get('value') or None
+            freq = row.get('Frequency') or row.get('frequency') or None
+            foreign_sell = row.get('ForeignSell') or row.get('foreignSell') or 0
+            foreign_buy = row.get('ForeignBuy') or row.get('foreignBuy') or 0
+            bid = row.get('Bid') or row.get('bid') or None
+            offer = row.get('Offer') or row.get('offer') or None
+            bid_volume = row.get('BidVolume') or row.get('bidVolume') or None
+            offer_volume = row.get('OfferVolume') or row.get('offerVolume') or None
 
-                if not rows:
-                    return None
+            foreign_buy_v = float(foreign_buy) if foreign_buy is not None else 0.0
+            foreign_sell_v = float(foreign_sell) if foreign_sell is not None else 0.0
 
-                results: List[Dict[str, Any]] = []
-                for row in rows:
-                    if isinstance(row, dict):
-                        code = row.get("code") or row.get("Code") or row.get("symbol")
-                        name = row.get("name") or row.get("Name") or row.get("company")
-                        last = row.get("last_price") or row.get("last") or row.get("close") or row.get("last_price")
-                        change = row.get("change") or row.get("Change") or 0
-                        pct = row.get("change_percent") or row.get("ChangePercent") or row.get("pct") or 0
-                        volume = row.get("volume") or row.get("Volume") or 0
-                        value = row.get("value") or row.get("Value") or 0
-                    elif isinstance(row, (list, tuple)) and len(row) >= 3:
-                        code = row[0]
-                        name = row[1]
-                        last = row[2]
-                        change = row[3] if len(row) > 3 else 0
-                        pct = row[4] if len(row) > 4 else 0
-                        volume = row[5] if len(row) > 5 else 0
-                        value = row[6] if len(row) > 6 else 0
-                    else:
-                        continue
-
-                    if not code:
-                        continue
-
-                    try:
-                        last_price = float(last) if last is not None else None
-                    except Exception:
-                        last_price = None
-
-                    results.append({
-                        "ticker": str(code).replace(".JK", "").strip(),
-                        "name": name,
-                        "last_price": last_price,
-                        "change": float(change) if change is not None else None,
-                        "change_percent": float(pct) if pct is not None else None,
-                        "volume": float(volume) if volume is not None else None,
-                        "value": float(value) if value is not None else None,
-                        "frequency": None,
-                        "timestamp": datetime.utcnow().isoformat() + "Z",
-                    })
-
-                return results if results else None
-            except Exception as e:
-                logger.debug(f"Error parsing IDX API payload: {e}")
-                return None
-
-        def _parse_rows_from_html(text: str) -> Optional[List[Dict[str, Any]]]:
-            try:
-                soup = BeautifulSoup(text, "html.parser")
-
-                # Attempt to find JSON data embedded in scripts
-                scripts = soup.find_all("script")
-                for s in scripts:
-                    if s.string and ("var data" in s.string or "DataTable" in s.string or "json" in s.string):
-                        try:
-                            start = s.string.find("[")
-                            end = s.string.rfind("]")
-                            if start != -1 and end != -1:
-                                payload = s.string[start:end + 1]
-                                parsed = json.loads(payload)
-                                results = _parse_idx_api_payload(parsed)
-                                if results:
-                                    return results
-                        except Exception:
-                            continue
-
-                table = soup.find("table")
-                if not table:
-                    return None
-
-                rows = table.find_all("tr")
-                results: List[Dict[str, Any]] = []
-                for r in rows[1:]:
-                    cols = [c.get_text(strip=True) for c in r.find_all(["td", "th"])]
-                    if not cols or len(cols) < 6:
-                        continue
-
-                    def _parse_num(s: str):
-                        try:
-                            return float(s.replace(",", "").replace("%", "").replace("—", "0"))
-                        except Exception:
-                            return 0.0
-
-                    code = cols[0].replace('.JK', '').strip()
-                    name = cols[1]
-                    last = _parse_num(cols[2])
-                    change = _parse_num(cols[3])
-                    pct = _parse_num(cols[4])
-                    vol = _parse_num(cols[5])
-                    value = _parse_num(cols[6]) if len(cols) > 6 else 0.0
-
-                    results.append({
-                        'ticker': code,
-                        'name': name,
-                        'last_price': last,
-                        'change': change,
-                        'change_percent': pct,
-                        'volume': vol,
-                        'value': value,
-                        'frequency': None,
-                        'timestamp': datetime.utcnow().isoformat() + 'Z'
-                    })
-
-                return results if results else None
-            except Exception as e:
-                logger.debug(f"Error parsing IDX HTML: {e}")
-                return None
-
-        def _try_official_idx_api() -> Optional[List[Dict[str, Any]]]:
-            candidate_urls = []
-            if settings.IDX_API_URL:
-                candidate_urls.append(settings.IDX_API_URL)
-
-            candidate_urls.extend([
-                "https://www.idx.co.id/umbraco/api/marketdata/GetStockSummary",
-                "https://www.idx.co.id/umbraco/api/stock/GetStockSummary",
-                "https://www.idx.co.id/umbraco/Api/MarketData/GetStockSummary",
-                "https://www.idx.co.id/umbraco/Api/Stock/GetStockSummary",
-            ])
-
-            import requests as _requests
-            headers_api = {
-                'Accept': 'application/json',
-                'User-Agent': headers['User-Agent'],
+            return {
+                'symbol': str(code).replace('.JK', '').upper() if code else None,
+                'stock_name': name,
+                'open': float(openp) if openp is not None else None,
+                'high': float(high) if high is not None else None,
+                'low': float(low) if low is not None else None,
+                'close': float(close) if close is not None else None,
+                'previous_close': float(prev) if prev is not None else None,
+                'change': float(change) if change is not None else None,
+                'volume': float(volume) if volume is not None else None,
+                'value': float(value) if value is not None else None,
+                'frequency': int(freq) if freq is not None else None,
+                'foreign_buy': foreign_buy_v,
+                'foreign_sell': foreign_sell_v,
+                'foreign_net': foreign_buy_v - foreign_sell_v,
+                'bid': float(bid) if bid is not None else None,
+                'offer': float(offer) if offer is not None else None,
+                'bid_volume': float(bid_volume) if bid_volume is not None else None,
+                'offer_volume': float(offer_volume) if offer_volume is not None else None,
+                'timestamp': datetime.utcnow().isoformat() + 'Z'
             }
-            if settings.IDX_API_TOKEN:
-                headers_api['Authorization'] = f"Bearer {settings.IDX_API_TOKEN}"
 
-            for api_url in candidate_urls:
-                if not api_url:
-                    continue
-                try:
-                    resp_api = _requests.get(api_url, headers=headers_api, timeout=timeout)
-                    if resp_api.status_code != 200:
-                        continue
-                    payload = resp_api.json()
-                    results = _parse_idx_api_payload(payload)
-                    if results:
-                        logger.info(f"Fetched IDX data from API endpoint: {api_url}")
-                        return results
-                except Exception as e_api:
-                    logger.debug(f"IDX API endpoint {api_url} failed: {e_api}")
+        api_url = settings.IDX_API_URL or 'https://www.idx.co.id/primary/TradingSummary/GetStockSummary?length=9999&start=0'
+
+        async def _fetch_browser_summary(url: str, timeout_seconds: int) -> Optional[List[Dict[str, Any]]]:
+            page_url = 'https://www.idx.co.id/id/data-pasar/ringkasan-perdagangan/ringkasan-saham/'
+            user_agent = (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            )
+            try:
+                async with async_playwright() as playwright:
+                    browser = await playwright.chromium.launch(
+                        headless=True,
+                        args=['--disable-blink-features=AutomationControlled']
+                    )
+                    context = await browser.new_context(
+                        user_agent=user_agent,
+                        locale='en-US',
+                        viewport={'width': 1280, 'height': 800},
+                        java_script_enabled=True,
+                    )
+                    page = await context.new_page()
+                    await page.add_init_script(
+                        """
+                        Object.defineProperty(navigator, 'webdriver', {get: () => false});
+                        Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+                        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                        """
+                    )
+                    await page.set_extra_http_headers({'Accept-Language': 'en-US,en;q=0.9'})
+                    await page.goto(page_url, timeout=timeout_seconds * 1000, wait_until='networkidle')
+                    await page.wait_for_timeout(2000)
+                    result = await page.evaluate(f"""
+                        async () => {{
+                            const resp = await fetch('{url}', {{
+                                method: 'GET',
+                                headers: {{ 'Accept': 'application/json' }},
+                                credentials: 'same-origin'
+                            }});
+                            if (!resp.ok) throw new Error(`IDX browser fetch failed: ${{resp.status}}`);
+                            return await resp.json();
+                        }}
+                    """)
+                    await context.close()
+                    await browser.close()
+
+                    if not isinstance(result, dict):
+                        logger.warning('IDX browser fetch returned unexpected payload type')
+                        return None
+
+                    rows = result.get('data') or result.get('Data') or result.get('results') or []
+                    normalized: List[Dict[str, Any]] = [_normalize_row(row) for row in rows]
+                    logger.info(f'Fetched {len(normalized)} records from IDX via Playwright')
+                    return normalized
+            except PlaywrightError as e:
+                logger.warning(f'IDX Playwright fetch failed: {e}')
+            except Exception as e:
+                logger.warning(f'IDX Playwright fetch error: {e}')
             return None
 
-        def _playwright_fetch() -> Optional[str]:
+        def _save_cache(rows: List[Dict[str, Any]]) -> None:
             try:
-                from playwright.sync_api import sync_playwright
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(
-                        headless=True,
-                        args=[
-                            '--no-sandbox',
-                            '--disable-setuid-sandbox',
-                            '--disable-dev-shm-usage',
-                            '--disable-blink-features=AutomationControlled',
-                            '--disable-infobars',
-                        ],
-                    )
-                    context = browser.new_context(
-                        user_agent=headers['User-Agent'],
-                        viewport={"width": 1280, "height": 900},
-                        locale="en-US",
-                        java_script_enabled=True,
-                        bypass_csp=True,
-                    )
-                    page = context.new_page()
-                    page.add_init_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                        "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});"
-                        "Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});"
-                    )
-                    page.goto(url, wait_until='domcontentloaded', timeout=timeout * 1000)
-                    page.wait_for_timeout(3000)
-                    content = page.content()
-                    context.close()
-                    browser.close()
-                    return content
+                with IDXScraper._snapshot_cache_path.open('w', encoding='utf-8') as f:
+                    json.dump({'fetched_at': datetime.utcnow().isoformat() + 'Z', 'data': rows}, f, ensure_ascii=False, indent=2)
             except Exception as e:
-                logger.debug(f"Playwright fetch error: {e}")
+                logger.warning(f'Failed to write IDX snapshot cache: {e}')
+
+        def _load_cache() -> Optional[List[Dict[str, Any]]]:
+            if not IDXScraper._snapshot_cache_path.exists():
+                return None
+            try:
+                age_seconds = (datetime.now() - datetime.fromtimestamp(IDXScraper._snapshot_cache_path.stat().st_mtime)).total_seconds()
+                if age_seconds > IDXScraper._snapshot_cache_days * 86400:
+                    logger.info('IDX snapshot cache expired')
+                    return None
+                with IDXScraper._snapshot_cache_path.open('r', encoding='utf-8') as f:
+                    payload = json.load(f)
+                    rows = payload.get('data') or []
+                    if not isinstance(rows, list):
+                        return None
+                    logger.info(f'Loaded {len(rows)} records from IDX cache')
+                    return rows
+            except Exception as e:
+                logger.warning(f'Failed to load IDX snapshot cache: {e}')
                 return None
 
+        cached = _load_cache()
+        if cached:
+            logger.debug('Using file cache for IDX summary')
+            return cached
+
+        rows = await _fetch_browser_summary(api_url, timeout)
+        if rows:
+            _save_cache(rows)
+            return rows
+
+        if not rows and IDXScraper._snapshot_cache_path.exists():
+            fallback = _load_cache()
+            if fallback:
+                logger.warning('Using stale IDX snapshot cache after browser fetch failure')
+                return fallback
+
+        return None
+
+    @staticmethod
+    async def fetch_idx_summary(timeout: int = 15) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Return IDX summary as a mapping symbol -> normalized row dict."""
         try:
-            # Official IDX API first
-            api_results = _try_official_idx_api()
-            if api_results:
-                return api_results
-
-            # HTML fetch path
-            text = None
-            try:
-                async with aiohttp.ClientSession(headers=headers) as session:
-                    async with session.get(url, timeout=timeout) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                        else:
-                            logger.error(f"IDX fetch failed with status {resp.status}")
-            except Exception as e:
-                logger.debug(f"Async HTML request failed: {e}")
-
-            if not text:
-                try:
-                    import requests
-                    r = requests.get(url, headers=headers, timeout=timeout)
-                    if r.status_code == 200:
-                        text = r.text
-                    else:
-                        logger.error(f"IDX sync fetch failed with status {r.status_code}")
-                except Exception as re:
-                    logger.debug(f"IDX sync fallback exception: {re}")
-
-            if text:
-                results = _parse_rows_from_html(text)
-                if results:
-                    return results
-
-            # Headless fallback after HTML parse failure
-            playwright_text = _playwright_fetch()
-            if playwright_text:
-                results = _parse_rows_from_html(playwright_text)
-                if results:
-                    logger.info('Fetched IDX data via Playwright fallback')
-                    return results
-
-            logger.error('IDX summary could not be parsed from any source')
-            return None
+            rows = await IDXScraper.fetch_summary(timeout=timeout)
+            if not rows:
+                return None
+            mapping: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                sym = r.get('symbol') or r.get('ticker')
+                if not sym:
+                    continue
+                mapping[str(sym).upper()] = r
+            logger.info(f"IDX summary mapping built with {len(mapping)} entries")
+            return mapping
         except Exception as e:
-            logger.exception(f"IDX fetch error: {e}")
+            logger.error(f"fetch_idx_summary failed: {e}")
             return None
 
     @staticmethod
@@ -368,7 +298,8 @@ class IDXScraper:
                 return None
             t = ticker.replace('.JK', '').upper()
             for item in data:
-                if item.get('ticker') and item['ticker'].upper() == t:
+                symbol = item.get('symbol') or item.get('StockCode') or item.get('code')
+                if symbol and str(symbol).replace('.JK', '').upper() == t:
                     return item
             return None
         except Exception as e:

@@ -19,7 +19,8 @@ class StockScreener:
     @staticmethod
     async def screen_stocks(
         stocks_data: Dict[str, Optional[pd.DataFrame]],
-        min_volume_spike: Optional[float] = None
+        min_volume_spike: Optional[float] = None,
+        idx_summary: Optional[Dict[str, Dict]] = None
     ) -> List[Dict]:
         """
         Screen stocks based on technical criteria.
@@ -49,7 +50,7 @@ class StockScreener:
             
             try:
                 result = await StockScreener._evaluate_stock(
-                    ticker, df, min_volume_spike
+                    ticker, df, min_volume_spike, idx_summary
                 )
                 if result["passed"]:
                     screened_stocks.append(result)
@@ -70,7 +71,8 @@ class StockScreener:
     async def _evaluate_stock(
         ticker: str,
         df: pd.DataFrame,
-        min_volume_spike: float
+        min_volume_spike: float,
+        idx_summary: Optional[Dict[str, Dict]] = None
     ) -> Dict:
         """
         Evaluate single stock against criteria.
@@ -118,6 +120,33 @@ class StockScreener:
             current_ma20 = _ensure_float(ma20.iloc[-1])
             current_rsi = _ensure_float(rsi.iloc[-1])
             current_rel_vol = _ensure_float(rel_volume.iloc[-1]) if rel_volume is not None else 0.0
+
+            # Additional IDX-derived metrics (if available)
+            idx_entry = None
+            idx_sym = ticker.replace('.JK', '').upper()
+            if idx_summary and isinstance(idx_summary, dict):
+                idx_entry = idx_summary.get(idx_sym) or idx_summary.get(idx_sym.upper())
+
+            idx_volume = None
+            idx_value = None
+            idx_frequency = None
+            foreign_buy = None
+            foreign_sell = None
+            foreign_net = None
+            bid_volume = None
+            offer_volume = None
+            if idx_entry:
+                try:
+                    idx_volume = float(idx_entry.get('volume') or 0)
+                    idx_value = float(idx_entry.get('value') or 0)
+                    idx_frequency = int(idx_entry.get('frequency') or 0)
+                    foreign_buy = float(idx_entry.get('foreign_buy') or 0)
+                    foreign_sell = float(idx_entry.get('foreign_sell') or 0)
+                    foreign_net = float(idx_entry.get('foreign_net') or (foreign_buy - foreign_sell))
+                    bid_volume = int(idx_entry.get('bid_volume') or 0)
+                    offer_volume = int(idx_entry.get('offer_volume') or 0)
+                except Exception:
+                    pass
             
             # Skip if NaN
             if pd.isna(current_ma20) or pd.isna(current_rsi):
@@ -132,17 +161,49 @@ class StockScreener:
                 f"Evaluating {ticker}: types -> price={type(current_price)}, ma20={type(current_ma20)}, rsi={type(current_rsi)}, rel_vol={type(current_rel_vol)}"
             )
 
-            # Evaluate criteria
+            # Evaluate base criteria (unchanged logic)
             signals = {}
             signals["uptrend"] = current_price > current_ma20
             signals["rsi_not_overbought"] = current_rsi < settings.RSI_OVERBOUGHT
             signals["volume_spike"] = current_rel_vol > settings.MIN_VOLUME_SPIKE
+
+            # Compute additional metrics and extra signals
+            avg_vol_20 = None
+            volume_ratio = None
+            if 'Volume' in df.columns and len(df['Volume'].dropna()) >= 5:
+                try:
+                    avg_vol_20 = float(df['Volume'].tail(20).mean())
+                    if avg_vol_20 and idx_volume is not None:
+                        volume_ratio = idx_volume / avg_vol_20 if avg_vol_20 > 0 else None
+                except Exception:
+                    avg_vol_20 = None
+
+            extra_signals = {}
+            # foreign flow signal
+            if foreign_net is not None:
+                extra_signals['foreign_flow_bull'] = foreign_net > 0
+                extra_signals['foreign_flow_bear'] = foreign_net < 0
+            else:
+                extra_signals['foreign_flow_bull'] = False
+                extra_signals['foreign_flow_bear'] = False
+
+            # volume ratio signal (use MIN_VOLUME_SPIKE threshold as heuristic)
+            if volume_ratio is not None:
+                extra_signals['volume_ratio_high'] = volume_ratio > settings.MIN_VOLUME_SPIKE
+            else:
+                extra_signals['volume_ratio_high'] = False
+
+            # frequency signal
+            try:
+                extra_signals['frequency_high'] = (idx_frequency is not None and idx_frequency > 1000)
+            except Exception:
+                extra_signals['frequency_high'] = False
             
-            # Count passing signals
+            # Count passing base signals (preserve original pass logic)
             passing_signals = sum(signals.values())
             total_signals = len(signals)
-            
-            # Build a clear reason with signal details
+
+            # Preserve original pass threshold
             passed = passing_signals >= 2
             signal_good = []
             signal_bad = []
@@ -165,6 +226,17 @@ class StockScreener:
                 f"Detail positif: {', '.join(signal_good)}. "
                 f"Akurasi historis: berdasarkan kriteria teknikal harian dan validasi internal."
             )
+            # Append extra metrics summary if available
+            extras = []
+            if volume_ratio is not None:
+                extras.append(f"volume_ratio={volume_ratio:.2f}x")
+            if foreign_net is not None:
+                extras.append(f"foreign_net={foreign_net:+.0f}")
+            if idx_frequency is not None:
+                extras.append(f"frequency={idx_frequency}")
+            if extras:
+                reason += " Extra: " + ", ".join(extras) + "."
+
             if not passed:
                 reason += f" Keterangan lemah: {', '.join(signal_bad)}."
             
@@ -176,7 +248,18 @@ class StockScreener:
                 "ma20": float(current_ma20),
                 "rsi": float(current_rsi),
                 "volume_spike": float(current_rel_vol),
-                "signals": signals
+                "signals": signals,
+                # IDX enriched fields
+                "idx_volume": idx_volume,
+                "idx_value": idx_value,
+                "idx_frequency": idx_frequency,
+                "foreign_buy": foreign_buy,
+                "foreign_sell": foreign_sell,
+                "foreign_net": foreign_net,
+                "bid_volume": bid_volume,
+                "offer_volume": offer_volume,
+                "volume_ratio": volume_ratio,
+                "extra_signals": extra_signals
             }
         except Exception as e:
             logger.exception(f"Error evaluating {ticker}: {e}")
@@ -209,7 +292,9 @@ class StockScreener:
             screened_stocks,
             key=lambda x: (
                 x.get("rsi", 100),  # Lower RSI is better (less overbought)
-                -x.get("volume_spike", 0)  # Higher volume spike is better
+                -x.get("volume_spike", 0),  # Higher volume spike is better
+                - (x.get('foreign_net') or 0),  # Higher foreign_net (net buy) is better
+                - (x.get('idx_frequency') or 0)  # Higher trading frequency is better
             )
         )
         

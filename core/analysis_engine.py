@@ -42,8 +42,19 @@ class AnalysisEngine:
             logger.info(f"Fetching data for {len(tickers)} stocks...")
             stocks_data = await YahooFetcher.fetch_multiple_stocks(tickers, period="3mo")
 
+            # Fetch IDX JSON summary and merge metadata
+            try:
+                idx_summary = await IDXScraper.fetch_idx_summary()
+                if idx_summary:
+                    logger.info(f"IDX summary fetched: {len(idx_summary)} symbols")
+                else:
+                    logger.warning("IDX summary not available; continuing with Yahoo-only data")
+            except Exception as e:
+                idx_summary = None
+                logger.warning(f"Failed to fetch IDX summary: {e}")
+
             logger.info("Screening stocks based on technical criteria...")
-            screened = await StockScreener.screen_stocks(stocks_data)
+            screened = await StockScreener.screen_stocks(stocks_data, None, idx_summary)
             if not screened:
                 logger.warning("No stocks passed screening")
                 return "⚠️ Maaf, belum ada saham yang lolos screening saat ini. Coba lagi nanti."
@@ -103,7 +114,18 @@ class AnalysisEngine:
             tickers = [stock["ticker"] for stock in stocks_list]
             stocks_data = await YahooFetcher.fetch_multiple_stocks(tickers, period="1mo")
 
-            screened = await StockScreener.screen_stocks(stocks_data)
+            # Try to enrich with IDX JSON data
+            try:
+                idx_summary = await IDXScraper.fetch_idx_summary()
+                if idx_summary:
+                    logger.info(f"IDX summary fetched for watchlist: {len(idx_summary)} symbols")
+                else:
+                    logger.warning("IDX summary not available for watchlist; proceeding without it")
+            except Exception as e:
+                idx_summary = None
+                logger.warning(f"Failed to fetch IDX summary for watchlist: {e}")
+
+            screened = await StockScreener.screen_stocks(stocks_data, None, idx_summary)
             if not screened:
                 return (
                     "⚠️ Belum ada saham yang menarik untuk hari ini. "
